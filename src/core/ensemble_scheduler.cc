@@ -39,15 +39,17 @@ namespace nvidia { namespace inferenceserver {
 
 namespace {
 
-// Step specifies the backend, providers and status objects used for
-// the internal infer request
-struct Step {
-  Step(size_t step_idx) : step_idx_(step_idx) {}
+class EnsembleContext;
 
-  std::shared_ptr<InferenceBackend> backend_;
-  std::shared_ptr<InferenceRequest> request_;
+// FIXME rework step (what is needed, and what structure should be used throughout
+// the pipeline)
+// Step refers to the backend, providers and status for the internal infer request
+struct Step {
+  Step(size_t step_idx) : infer_status_(nullptr), step_idx_(step_idx) {}
+
+  std::shared_ptr<EnsembleContext> ctx_;
   std::unordered_map<std::string, std::shared_ptr<AllocatedMemory>> output_map_;
-  Status infer_status_;
+  TRITONSERVER_Error* infer_status_;
 
   size_t step_idx_;
 };
@@ -64,9 +66,9 @@ struct Step {
 class EnsembleContext {
  public:
   EnsembleContext(
+    InferenceStatsAggregator* stats_aggregator,
       InferenceServer* is, EnsembleInfo* info,
-      const std::shared_ptr<ModelInferStats>& stats,
-      const std::shared_ptr<InferenceRequest>& request, cudaStream_t stream);
+      std::unique_ptr<InferenceRequest>& request, cudaStream_t stream);
 
   // Perform transition on 'context' state given the information of
   // 'completed_step'
@@ -92,7 +94,7 @@ class EnsembleContext {
   // Storing each tensor's meta data in 1st element, batch size in 2nd
   // (0 for non-batchable), and the raw data in 3rd.
   using TensorData =
-      std::tuple<InferenceRequest::Input, size_t, std::shared_ptr<Memory>>;
+      std::tuple<std::unique_ptr<InferenceRequest::Input>, size_t, std::shared_ptr<Memory>>;
 
   // Return the list of step that becomes ready due to tensor update
   // from 'completed_step'
@@ -136,6 +138,7 @@ class EnsembleContext {
       const size_t tensor_batch_size, const std::vector<int64_t>& dims,
       std::vector<int64_t>* mutable_dims);
 
+  InferenceStatsAggregator* stats_aggregator_;
   InferenceServer* is_;
 
   EnsembleInfo* info_;
@@ -169,11 +172,7 @@ class EnsembleContext {
 
   // Objects related to the ensemble infer request
   Status ensemble_status_;
-  std::shared_ptr<ModelInferStats> stats_;
-  std::shared_ptr<InferenceRequest> request_;
-
-  // Output tensors whose labels are not provided by the ensemble
-  std::set<std::string> no_label_tensors_;
+  std::unique_ptr<InferenceRequest> request_;
 
   // The allocator that will be used to allocate buffers for the
   // inference result tensors.
@@ -184,11 +183,11 @@ class EnsembleContext {
 };
 
 EnsembleContext::EnsembleContext(
+  InferenceStatsAggregator* stats_aggregator,
     InferenceServer* is, EnsembleInfo* info,
-    const std::shared_ptr<ModelInferStats>& stats,
-    const std::shared_ptr<InferenceRequest>& request, cudaStream_t stream)
-    : is_(is), info_(info), stream_(stream), inflight_step_counter_(0),
-      stats_(stats), request_(request),
+    std::unique_ptr<InferenceRequest>& request, cudaStream_t stream)
+    : stats_aggregator_(stats_aggregator), is_(is), info_(info), stream_(stream), inflight_step_counter_(0),
+      request_(std::move(request)),
       allocator_(nullptr, TRITONSERVER_ResponseAllocatorDelete)
 {
   // Obtain backend handles of all models in ensemble request such that
@@ -218,8 +217,8 @@ EnsembleContext::EnsembleContext(
   for (const auto& ensemble_output : info_->ensemble_output_shape_) {
     ignored_tensor.insert(ensemble_output.first);
   }
-  for (const auto& pr : request_->ImmutableRequestedOutputs()) {
-    ignored_tensor.erase(pr.first);
+  for (const auto& requested_output : request_->ImmutableRequestedOutputs()) {
+    ignored_tensor.erase(requested_output);
   }
   if (ignored_tensor.empty()) {
     tensor_to_step_ = &(info_->tensor_to_step_);
@@ -272,7 +271,8 @@ EnsembleContext::EnsembleContext(
       auto it = tensor_data_.find(input->Name());
       if (it != tensor_data_.end()) {
         auto& tensor_data = it->second;
-        std::get<0>(tensor_data) = *input;
+        std::get<0>(tensor_data).reset(new InferenceRequest::Input(input->Name(),
+        input->DType(), input->Shape()));
         std::get<1>(tensor_data) = (info_->allow_batching_ ? batch_size_ : 0);
         std::get<2>(tensor_data) = input->Data();
       } else {
@@ -280,17 +280,6 @@ EnsembleContext::EnsembleContext(
             Status::Code::INVALID_ARG,
             "unexpected input '" + input->Name() +
                 "' in request header that does not map to any ensemble inputs");
-      }
-    }
-  }
-
-  if (ensemble_status_.IsOk()) {
-    const std::shared_ptr<LabelProvider>& label_provider =
-        response_provider_->GetLabelProvider();
-    for (const auto& pair : info_->ensemble_output_shape_) {
-      const auto& label = label_provider->GetLabel(pair.first, 0);
-      if (label == "") {
-        no_label_tensors_.emplace(pair.first);
       }
     }
   }
@@ -354,6 +343,29 @@ EnsembleContext::ResponseRelease(
   // Don't do anything when releasing a buffer since ResponseAlloc
   // passes the ownership of the data to ensemble context.
   return nullptr;  // Success
+}
+
+void
+EnsembleContext::RequestComplete(
+    TRITONSERVER_InferenceRequest* request, void* userp)
+{
+  LOG_TRITONSERVER_ERROR(
+      TRITONSERVER_InferenceRequestDelete(request),
+      "deleting ensemble inference request");
+}
+
+void
+EnsembleContext::ResponseComplete(
+    TRITONSERVER_InferenceResponse* response, void* userp)
+{
+  // FIXME userp as capture
+  auto ctx_step_ptr = reinterpret_cast<std::pair<std::shared_ptr<EnsembleContext>, std::shared_ptr<Step>>*>(userp);
+  // FIXME infer_stats is added when constructing the request, this is different
+  // from the one in the ensemble backend, purely used for accumulating duration in
+  // requests
+  ctx_step_ptr->second->infer_status_ = TRITONSERVER_InferenceResponseError(response);
+  EnsembleContext::Proceed(ctx_step_ptr->first, ctx_step_ptr->second);
+  delete ctx_step_ptr;
 }
 
 void
@@ -443,28 +455,6 @@ EnsembleContext::UpdateEnsembleState(
           std::get<2>(tensor_data) =
               std::move(completed_step->output_map_[it->first]);
           updated_tensors.push_back(it->second);
-
-          auto tensor_it = no_label_tensors_.find(it->second);
-          if (tensor_it != no_label_tensors_.end()) {
-            // Check the inner model's lookup map first in case it is also an
-            // ensemble model. In that case, the label of the inner model may
-            // come from another model.
-#if 0
-            // FIXME don't need secondary lable provider
-            InferResponseProvider::SecondaryLabelProvider provider;
-            if (completed_step->response_provider_->GetSecondaryLabelProvider(
-                    it->first, &provider)) {
-              response_provider_->SetSecondaryLabelProvider(
-                  *tensor_it, provider);
-            } else {
-              const std::shared_ptr<LabelProvider>& label_provider =
-                  completed_step->response_provider_->GetLabelProvider();
-              response_provider_->SetSecondaryLabelProvider(
-                  *tensor_it, std::make_pair(it->first, label_provider));
-            }
-#endif
-            no_label_tensors_.erase(tensor_it);
-          }
         } else {
           return Status(
               Status::Code::INTERNAL,
@@ -732,86 +722,36 @@ void
 EnsembleContext::ScheduleSteps(
     const std::shared_ptr<EnsembleContext>& context, const StepList& steps)
 {
-  // FIXME
-#if 0
   for (const auto& step : steps) {
-#ifdef TRTIS_ENABLE_STATS
-    auto infer_stats = std::make_shared<ModelInferStats>(
-        context->is_->StatusManager(), step->backend_->Name());
-    infer_stats->CaptureTimestamp(
-        ModelInferStats::TimestampKind::kRequestStart);
-    infer_stats->SetRequestedVersion(step->backend_->Version());
-    infer_stats->SetMetricReporter(step->backend_->MetricReporter());
-    infer_stats->SetBatchSize(step->request_->BatchSize());
-    infer_stats->SetFailed(true);
-
-    // Passing trace-related objects down
-    infer_stats->SetTraceManager(context->stats_->GetTraceManager());
-    infer_stats->NewTrace(context->stats_->GetTrace());
-#else
-    auto infer_stats = std::make_shared<ModelInferStats>();
-#endif  // TRTIS_ENABLE_STATS
-
-    context->is_->InferAsync(
-        step->backend_, step->request_, step->response_provider_, infer_stats,
-        [context, step, infer_stats](const Status& status) mutable {
-          if (!status.IsOk()) {
-            LOG_VERBOSE(1) << "Ensemble infer failed: " << status.Message();
-          }
-
-#ifdef TRTIS_ENABLE_STATS
-          infer_stats->SetFailed(!status.IsOk());
-          infer_stats->CaptureTimestamp(
-              ModelInferStats::TimestampKind::kRequestEnd);
-          infer_stats->Report();
-#endif  // TRTIS_ENABLE_STATS
-
-          step->infer_status_ = status;
-
-#ifdef TRTIS_ENABLE_STATS
-          {
-            std::lock_guard<std::mutex> lk(context->mutex_);
-            // Accumulate the queue and compute durations from this
-            // composing model
-            context->stats_->IncrementQueueDuration(*infer_stats);
-            context->stats_->IncrementComputeDuration(*infer_stats);
-            context->stats_->IncrementComputeInputDuration(*infer_stats);
-            context->stats_->IncrementComputeInferDuration(*infer_stats);
-            context->stats_->IncrementComputeOutputDuration(*infer_stats);
-          }
-#endif  // TRTIS_ENABLE_STATS
-
-          Proceed(context, step);
-        });
+    // FIXME callback
+    context->is_->InferAsync(step->request_);
   }
-#endif
 }
 
 }  // namespace
 
 Status
 EnsembleScheduler::Create(
+    InferenceStatsAggregator* const stats_aggregator,
     InferenceServer* const server, const ModelConfig& config,
     std::unique_ptr<Scheduler>* scheduler)
 {
-  scheduler->reset(new EnsembleScheduler(server, config));
+  scheduler->reset(new EnsembleScheduler(stats_aggregator, server, config));
   return Status::Success;
 }
 
-void
-EnsembleScheduler::Enqueue(
-    const std::shared_ptr<ModelInferStats>& stats,
-    const std::shared_ptr<InferenceRequest>& request)
+Status
+EnsembleScheduler::Enqueue(std::unique_ptr<InferenceRequest>& request)
 {
   std::shared_ptr<EnsembleContext> context(new EnsembleContext(
-      is_, info_.get(), stats, request, response_provider, OnComplete,
-      stream_));
+      stats_aggregator_, is_, info_.get(), request, stream_));
   EnsembleContext::Proceed(context);
 }
 
 EnsembleScheduler::EnsembleScheduler(
+  InferenceStatsAggregator* const stats_aggregator,
     InferenceServer* const server, const ModelConfig& config)
-    : is_(server), stream_(nullptr)
+    : stats_aggregator_(stats_aggregator), is_(server), stream_(nullptr)
 {
 #ifdef TRTIS_ENABLE_GPU
   // create CUDA stream

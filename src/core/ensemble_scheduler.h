@@ -80,19 +80,20 @@ class EnsembleScheduler : public Scheduler {
   // Create a scheduler to process ensemble requests and
   // to dispatch requests to models in ensemble internally.
   static Status Create(
+    InferenceStatsAggregator* const stats_aggregator,
       InferenceServer* const server, const ModelConfig& config,
       std::unique_ptr<Scheduler>* scheduler);
 
   ~EnsembleScheduler();
 
   // \see Scheduler::Enqueue()
-  void Enqueue(
-      const std::shared_ptr<ModelInferStats>& stats,
-      const std::shared_ptr<InferenceRequest>& request) override;
+  Status Enqueue(std::unique_ptr<InferenceRequest>& request) override;
 
  private:
-  EnsembleScheduler(InferenceServer* const server, const ModelConfig& config);
+  EnsembleScheduler(
+    InferenceStatsAggregator* const stats_aggregator, InferenceServer* const server, const ModelConfig& config);
 
+  InferenceStatsAggregator* const stats_aggregator_;
   InferenceServer* const is_;
 
   // Ensemble information that is built from model config
